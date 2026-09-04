@@ -152,24 +152,50 @@ public class StreamingChannelManager implements AutoCloseable {
         return null;
     }
 
+    /** The extracted Rust core is about 29 MiB; leave room for the extraction itself. */
+    protected static final long REQUIRED_TMP_BYTES = 48L * 1024 * 1024;
+
     /** Works out the likely cause from the running environment, for when the cause chain is gone. */
     protected static String diagnoseFromEnvironment() {
         var tmpDir = System.getProperty("java.io.tmpdir");
+        return diagnoseEnvironment(tmpDir, isMusl(), isWritable(tmpDir), usableSpace(tmpDir),
+                isNoexec(readMounts(), tmpDir));
+    }
 
-        if (isMusl()) {
+    /** The decision itself, separated from the probing so every branch can be tested. */
+    protected static String diagnoseEnvironment(String tmpDir, boolean musl, boolean writable,
+                                                long usableBytes, boolean noexec) {
+        if (musl) {
             return "This looks like an Alpine/musl image. The SDK needs glibc 2.26 or newer; "
                     + "rebuild the Connect image on a glibc base (UBI or Debian).";
         }
-        if (!isWritable(tmpDir)) {
+        if (!writable) {
             return "java.io.tmpdir (" + tmpDir + ") is not writable - typically a read-only root "
                     + "filesystem. Mount an emptyDir and point -Djava.io.tmpdir at it.";
         }
-        if (isNoexec(readMounts(), tmpDir)) {
+        if (usableBytes >= 0 && usableBytes < REQUIRED_TMP_BYTES) {
+            return String.format(
+                    "java.io.tmpdir (%s) has only %d MiB free but the native library needs about "
+                            + "%d MiB to be extracted. On Strimzi /tmp is a memory-backed emptyDir "
+                            + "defaulting to 5Mi: raise it with "
+                            + "spec.template.pod.tmpDirSizeLimit (128Mi is plenty), or point "
+                            + "-Djava.io.tmpdir at a larger volume.",
+                    tmpDir, usableBytes / (1024 * 1024), REQUIRED_TMP_BYTES / (1024 * 1024));
+        }
+        if (noexec) {
             return "java.io.tmpdir (" + tmpDir + ") is on a noexec mount, so the extracted library "
                     + "cannot be mapped. Point -Djava.io.tmpdir at a writable, exec-allowed volume.";
         }
         return "The environment looks usable from here, so check the WARN line from "
                 + "com.snowflake.ingest.streaming.FFIBootstrap in the worker log.";
+    }
+
+    private static long usableSpace(String path) {
+        try {
+            return path == null ? -1 : new java.io.File(path).getUsableSpace();
+        } catch (SecurityException e) {
+            return -1;
+        }
     }
 
     private static boolean isMusl() {

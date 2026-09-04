@@ -61,6 +61,45 @@ class NativeLoadDiagnosisTest {
         assertTrue(message.contains("first time the SDK is touched"), message);
     }
 
+    private static final long PLENTY = 512L * 1024 * 1024;
+
+    @Test
+    void namesAnUndersizedTmpDir() {
+        // Strimzi mounts /tmp as a memory-backed emptyDir defaulting to 5Mi, and the extracted
+        // library is ~29 MiB. Everything else about the environment looks fine, which is exactly
+        // what made this one hard to spot.
+        var message = StreamingChannelManager.diagnoseEnvironment(
+                "/tmp", false, true, 5L * 1024 * 1024, false);
+
+        assertTrue(message.contains("tmpDirSizeLimit"), message);
+        assertTrue(message.contains("5 MiB free"), message);
+    }
+
+    @Test
+    void aRoomyTmpDirIsNotBlamed() {
+        var message = StreamingChannelManager.diagnoseEnvironment("/tmp", false, true, PLENTY, false);
+
+        assertFalse(message.contains("tmpDirSizeLimit"), message);
+        assertTrue(message.contains("FFIBootstrap"), message);
+    }
+
+    @Test
+    void ordersTheChecksSoTheMostFundamentalCauseWins() {
+        // a musl image with a tiny, read-only tmpdir is still first and foremost a musl image
+        assertTrue(StreamingChannelManager.diagnoseEnvironment("/tmp", true, false, 1024, true)
+                .contains("Alpine/musl"));
+        // and an unwritable tmpdir matters before its size does
+        assertTrue(StreamingChannelManager.diagnoseEnvironment("/tmp", false, false, 1024, true)
+                .contains("not writable"));
+    }
+
+    @Test
+    void unknownFreeSpaceIsNotTreatedAsFull() {
+        var message = StreamingChannelManager.diagnoseEnvironment("/tmp", false, true, -1, false);
+
+        assertFalse(message.contains("tmpDirSizeLimit"), message);
+    }
+
     @Test
     void picksTheLongestMatchingMountWhenDecidingAboutNoexec() {
         var mounts = """

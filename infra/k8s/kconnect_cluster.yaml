@@ -12,6 +12,15 @@ spec:
   replicas: 1
   bootstrapServers: host.minikube.internal:9093
 
+  template:
+    pod:
+      # The v4 connector's SDK extracts a ~29 MiB Rust core into /tmp and dlopen()s it.
+      # Strimzi's /tmp is a memory-backed emptyDir defaulting to 5Mi, which is far too small:
+      # the extraction fails with "No space left on device" and the task dies with the
+      # unhelpful "Failed to load both main and test libraries".
+      # This is pod memory, so keep it just big enough.
+      tmpDirSizeLimit: 128Mi
+
   logging:
     type: inline
     loggers:
@@ -96,7 +105,7 @@ spec:
       - name: snowflake-sink-connector-v4
         artifacts:
           - type: jar
-            url: https://github.com/mvjr98/snowflake-sink-connector-v4/releases/download/v4.0.1/snowflake-sink-connector-4.0.1.jar
+            url: https://github.com/mvjr98/snowflake-sink-connector-v4/releases/download/v4.0.2/snowflake-sink-connector-4.0.2.jar
           # keep only if your connector configs actually use these transforms
           - type: jar
             url: https://github.com/datastreambrasil/smt/releases/download/v1.0.2/smt-1.0.2.jar

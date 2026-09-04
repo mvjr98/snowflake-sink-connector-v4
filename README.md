@@ -107,3 +107,44 @@ to you.
 
 A ready-to-edit connector definition is in
 [`infra/k8s/connectors/sink-snowflake-v4_sample.yaml`](infra/k8s/connectors/sink-snowflake-v4_sample.yaml).
+
+### Deploying on Strimzi: raise the /tmp size limit
+
+The SDK extracts its ~29 MiB Rust core into `java.io.tmpdir` and `dlopen()`s it from there.
+Strimzi mounts `/tmp` as a **memory-backed `EmptyDir` that defaults to `5Mi`**, so the extraction
+fails with `No space left on device` and the task dies with the unhelpful
+`Failed to load both main and test libraries`:
+
+```yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+spec:
+  template:
+    pod:
+      tmpDirSizeLimit: 128Mi
+```
+
+It is pod memory rather than disk, so keep it just big enough. If you would rather not spend pod
+memory, mount a disk-backed volume and point the JVM at it instead:
+
+```yaml
+spec:
+  jvmOptions:
+    javaSystemProperties:
+      - name: java.io.tmpdir
+        value: /tmp/native
+  template:
+    pod:
+      volumes:
+        - name: native-tmp
+          emptyDir:
+            sizeLimit: 256Mi
+    connectContainer:
+      volumeMounts:
+        - name: native-tmp
+          mountPath: /tmp/native
+```
+
+From v4.0.2 the connector detects this and says so, instead of surfacing the SDK's message. Note
+that the JVM caches a failed static initializer, so the SDK's own loader error is only logged the
+first time it is touched in a worker — a restarted task never sees it again.
