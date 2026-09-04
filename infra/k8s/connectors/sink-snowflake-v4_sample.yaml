@@ -1,0 +1,49 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: sink-snowflake-v4
+  labels:
+    strimzi.io/cluster: kconnect
+spec:
+  autoRestart:
+    enabled: true
+  class: br.com.datastreambrasil.v4.SnowflakeSinkConnector
+  tasksMax: 6
+  config:
+    topics: "cdc.test.dbo.events"
+
+    # --- Snowflake identity ---------------------------------------------------
+    # Identical to v3. The account, database and schema are read out of the URL, and the
+    # role is the user's default.
+    url: "jdbc:snowflake://xxxxxx.snowflakecomputing.com?schema=LZ_IH&db=DATB200D&CLIENT_SESSION_KEEP_ALIVE=TRUE"
+    user: "SVC_KCONNECT"
+    # Same as v3: the PAT goes in `password`.
+    # Prefer a Strimzi secret reference over an inline value.
+    password: "${secrets:kafka/snowflake-pat:token}"
+    schema: "LZ_IH"
+    table: "events"
+
+    # Only needed if the PAT's ROLE_RESTRICTION names a role other than the user's default.
+    # role: "KCONNECT_ROLE"
+
+    # --- Mode -----------------------------------------------------------------
+    # true  -> rows land in EVENTS_INGEST and nothing else runs. Dedup is a Dynamic
+    #          Table's job. No warehouse and no cleanup job at steady state.
+    # false -> the connector also runs MERGE/DELETE into EVENTS, like v3 did.
+    ingestion_only: "true"
+
+    # --- Streaming tuning (optional) ------------------------------------------
+    # higher lag buffers longer and writes fewer, larger files
+    # max_client_lag_seconds: "10"
+    # channel names are <prefix>_<topic>_<partition> and must be stable across restarts
+    # channel_name_prefix: "sink-snowflake-v4"
+    # ih_blockid is unused when ingestion_only is true; billing is per ingested byte,
+    # so dropping it saves ~36 bytes per row
+    # ignore_columns: "IH_BLOCKID"
+
+    key.converter: "io.confluent.connect.avro.AvroConverter"
+    key.converter.schema.registry.url: "http://host.minikube.internal:8085"
+    key.converter.schemas.enable: true
+    value.converter: "io.confluent.connect.avro.AvroConverter"
+    value.converter.schema.registry.url: "http://host.minikube.internal:8085"
+    value.converter.schemas.enable: true
