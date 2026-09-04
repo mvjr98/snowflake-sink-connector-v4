@@ -1,0 +1,64 @@
+name: release
+
+# Tag the commit and push the tag to cut a release:
+#   git tag v4.0.0 && git push meu v4.0.0
+# The shaded jar is attached to the release, which is what the Strimzi
+# KafkaConnect build pulls by URL.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B clean package
+
+      - name: Check the shaded jar
+        run: |
+          set -euo pipefail
+          JAR=$(ls target/snowflake-sink-connector-*.jar | grep -v original)
+          echo "jar: $JAR ($(du -h "$JAR" | cut -f1))"
+
+          # the connector classes must be there
+          unzip -l "$JAR" | grep -q 'br/com/datastreambrasil/v4/SnowflakeSinkConnector.class'
+
+          # the Snowpipe Streaming SDK loads a Rust core over JNI; without this the
+          # connector dies at runtime with UnsatisfiedLinkError
+          unzip -l "$JAR" | grep -q 'rust/linux-x86_64/libcyclone_shared.so'
+
+          # the SDK jar is signed - copying its signatures into the uber-jar makes the
+          # JVM reject the classes with "Invalid signature file digest"
+          if unzip -l "$JAR" | grep -Eq 'META-INF/.*\.(SF|DSA|RSA)'; then
+            echo "signature files leaked into the uber-jar" >&2
+            exit 1
+          fi
+          echo "jar looks good"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snowflake-sink-connector
+          path: target/snowflake-sink-connector-*.jar
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/snowflake-sink-connector-*.jar
+          generate_release_notes: true
