@@ -6,6 +6,7 @@ import com.snowflake.ingest.streaming.SnowflakeStreamingIngestChannel;
 import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClient;
 import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClientFactory;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -92,7 +93,57 @@ public class StreamingChannelManager implements AutoCloseable {
             builder.setParameterOverrides(Map.of("max_client_lag_seconds", maxClientLagSeconds));
         }
 
-        return builder.build();
+        try {
+            return builder.build();
+        } catch (NoClassDefFoundError | UnsatisfiedLinkError | ExceptionInInitializerError e) {
+            throw new ConnectException(nativeLoadDiagnosis(e), e);
+        }
+    }
+
+    /**
+     * The SDK loads a Rust core over JNI by extracting it from the jar into a temp directory and
+     * calling System.load on it. Every way that can fail surfaces as the same
+     * "Failed to load both main and test libraries", so the message alone tells you nothing - the
+     * detail that distinguishes them sits further down the cause chain, and is lost entirely once
+     * a later access reports "Could not initialize class FFIClient" instead.
+     *
+     * <p>Pull the root cause up into the message and say what each variant means.
+     */
+    protected static String nativeLoadDiagnosis(Throwable error) {
+        var root = error;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        var detail = String.valueOf(root.getMessage());
+
+        String likelyCause;
+        if (detail.contains("libgcc_s.so") || detail.contains("musl") || detail.contains("Error relocating")) {
+            likelyCause = "The image looks like Alpine/musl. The SDK needs glibc 2.26 or newer; "
+                    + "rebuild the Connect image on a glibc base (UBI or Debian).";
+        } else if (detail.contains("failed to map segment")) {
+            likelyCause = "java.io.tmpdir is mounted noexec, so the extracted library cannot be "
+                    + "mapped. Point -Djava.io.tmpdir at a writable, exec-allowed volume.";
+        } else if (detail.contains("Read-only file system") || detail.contains("Permission denied")) {
+            likelyCause = "java.io.tmpdir is not writable - typically a read-only root filesystem. "
+                    + "Mount an emptyDir and point -Djava.io.tmpdir at it.";
+        } else {
+            likelyCause = "Check the WARN line from com.snowflake.ingest.streaming.FFIBootstrap in "
+                    + "the worker log for the underlying loader error.";
+        }
+
+        var tmpDir = System.getProperty("java.io.tmpdir");
+        var writable = false;
+        try {
+            writable = tmpDir != null && new java.io.File(tmpDir).canWrite();
+        } catch (SecurityException ignored) {
+            // leave it as not writable
+        }
+
+        return String.format(
+                "Could not load the Snowpipe Streaming native library. %s "
+                        + "[os=%s, arch=%s, java.io.tmpdir=%s, writable=%s, rootCause=%s: %s]",
+                likelyCause, System.getProperty("os.name"), System.getProperty("os.arch"),
+                tmpDir, writable, root.getClass().getName(), detail);
     }
 
     /**
