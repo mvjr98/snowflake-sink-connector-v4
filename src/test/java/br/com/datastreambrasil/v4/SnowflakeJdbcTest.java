@@ -47,6 +47,19 @@ class SnowflakeJdbcTest {
     }
 
     @Test
+    void handlesTheProductionUrlShape() {
+        // region-qualified host, extra driver parameters, schema and db mixed in
+        var url = "jdbc:snowflake://ab12345.us-east-1.snowflakecomputing.com"
+                + "?schema=MYSCHEMA&db=MYDB&warehouse=MYWH&CLIENT_SESSION_KEEP_ALIVE=TRUE&tracing=WARNING";
+
+        assertEquals("ab12345", SnowflakeJdbc.accountFrom(url).orElseThrow());
+        assertEquals("MYDB", SnowflakeJdbc.urlParam(url, "db", "database").orElseThrow());
+        assertEquals("MYSCHEMA", SnowflakeJdbc.urlParam(url, "schema").orElseThrow());
+        // the endpoint keeps the full host, so the region qualifier is preserved
+        assertEquals("ab12345.us-east-1.snowflakecomputing.com", SnowflakeJdbc.hostFrom(url).orElseThrow());
+    }
+
+    @Test
     void anExplicitAccountParameterWinsOverTheHost() {
         assertEquals("other", SnowflakeJdbc.accountFrom(
                 "jdbc:snowflake://acme.snowflakecomputing.com?account=other").orElseThrow());

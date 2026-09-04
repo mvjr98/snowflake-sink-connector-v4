@@ -1,0 +1,16 @@
+{
+    "connector.class": "br.com.datastreambrasil.v4.SnowflakeSinkConnector",
+    "topics": "source_debeziumsqlserver_crmb002d_dbo_grupo3_online_g.CRMB002D.dbo.CRME025D",
+    "url": "jdbc:snowflake://ffa72186.us-east-1.snowflakecomputing.com?schema=CRMB002D&db=LZ_SQL_IH_PRD&warehouse=WH_IH_PROD&CLIENT_SESSION_KEEP_ALIVE=TRUE&tracing=WARNING",
+    "user": "${secrets:snowflake-creds:username}",
+    "password": "${secrets:snowflake-creds:password}",
+    "table": "CRME025D",
+    "schema": "CRMB002D",
+    "ingestion_only": "true",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://schema-registry.inthub:8081",
+    "key.converter.schemas.enable": true,
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://schema-registry.inthub:8081",
+    "value.converter.schemas.enable": true
+}
