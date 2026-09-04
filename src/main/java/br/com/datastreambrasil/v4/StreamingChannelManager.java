@@ -116,34 +116,111 @@ public class StreamingChannelManager implements AutoCloseable {
         }
         var detail = String.valueOf(root.getMessage());
 
-        String likelyCause;
-        if (detail.contains("libgcc_s.so") || detail.contains("musl") || detail.contains("Error relocating")) {
-            likelyCause = "The image looks like Alpine/musl. The SDK needs glibc 2.26 or newer; "
-                    + "rebuild the Connect image on a glibc base (UBI or Debian).";
-        } else if (detail.contains("failed to map segment")) {
-            likelyCause = "java.io.tmpdir is mounted noexec, so the extracted library cannot be "
-                    + "mapped. Point -Djava.io.tmpdir at a writable, exec-allowed volume.";
-        } else if (detail.contains("Read-only file system") || detail.contains("Permission denied")) {
-            likelyCause = "java.io.tmpdir is not writable - typically a read-only root filesystem. "
-                    + "Mount an emptyDir and point -Djava.io.tmpdir at it.";
-        } else {
-            likelyCause = "Check the WARN line from com.snowflake.ingest.streaming.FFIBootstrap in "
-                    + "the worker log for the underlying loader error.";
+        // Only the first attempt in a JVM carries the real loader error. Once the static
+        // initializer has failed, the JVM marks the class erroneous and every later attempt gets
+        // "Could not initialize class FFIClient" with the cause gone - which is what a restarted
+        // task sees. Fall back to inspecting the environment ourselves.
+        var likelyCause = diagnoseFromMessage(detail);
+        if (likelyCause == null) {
+            likelyCause = diagnoseFromEnvironment()
+                    + " (the loader error itself is only logged the first time the SDK is touched "
+                    + "in a JVM; restart the worker to see it again)";
         }
 
         var tmpDir = System.getProperty("java.io.tmpdir");
-        var writable = false;
-        try {
-            writable = tmpDir != null && new java.io.File(tmpDir).canWrite();
-        } catch (SecurityException ignored) {
-            // leave it as not writable
-        }
-
         return String.format(
                 "Could not load the Snowpipe Streaming native library. %s "
                         + "[os=%s, arch=%s, java.io.tmpdir=%s, writable=%s, rootCause=%s: %s]",
                 likelyCause, System.getProperty("os.name"), System.getProperty("os.arch"),
-                tmpDir, writable, root.getClass().getName(), detail);
+                tmpDir, isWritable(tmpDir), root.getClass().getName(), detail);
+    }
+
+    /** Reads the cause off the loader error, when we still have it. Null when unrecognised. */
+    protected static String diagnoseFromMessage(String detail) {
+        if (detail.contains("libgcc_s.so") || detail.contains("musl") || detail.contains("Error relocating")) {
+            return "The image looks like Alpine/musl. The SDK needs glibc 2.26 or newer; "
+                    + "rebuild the Connect image on a glibc base (UBI or Debian).";
+        }
+        if (detail.contains("failed to map segment")) {
+            return "java.io.tmpdir is mounted noexec, so the extracted library cannot be mapped. "
+                    + "Point -Djava.io.tmpdir at a writable, exec-allowed volume.";
+        }
+        if (detail.contains("Read-only file system") || detail.contains("Permission denied")) {
+            return "java.io.tmpdir is not writable - typically a read-only root filesystem. "
+                    + "Mount an emptyDir and point -Djava.io.tmpdir at it.";
+        }
+        return null;
+    }
+
+    /** Works out the likely cause from the running environment, for when the cause chain is gone. */
+    protected static String diagnoseFromEnvironment() {
+        var tmpDir = System.getProperty("java.io.tmpdir");
+
+        if (isMusl()) {
+            return "This looks like an Alpine/musl image. The SDK needs glibc 2.26 or newer; "
+                    + "rebuild the Connect image on a glibc base (UBI or Debian).";
+        }
+        if (!isWritable(tmpDir)) {
+            return "java.io.tmpdir (" + tmpDir + ") is not writable - typically a read-only root "
+                    + "filesystem. Mount an emptyDir and point -Djava.io.tmpdir at it.";
+        }
+        if (isNoexec(readMounts(), tmpDir)) {
+            return "java.io.tmpdir (" + tmpDir + ") is on a noexec mount, so the extracted library "
+                    + "cannot be mapped. Point -Djava.io.tmpdir at a writable, exec-allowed volume.";
+        }
+        return "The environment looks usable from here, so check the WARN line from "
+                + "com.snowflake.ingest.streaming.FFIBootstrap in the worker log.";
+    }
+
+    private static boolean isMusl() {
+        try (var libs = java.nio.file.Files.list(java.nio.file.Path.of("/lib"))) {
+            return libs.anyMatch(p -> p.getFileName().toString().startsWith("ld-musl-"));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean isWritable(String path) {
+        try {
+            return path != null && new java.io.File(path).canWrite();
+        } catch (SecurityException e) {
+            return false;
+        }
+    }
+
+    private static String readMounts() {
+        try {
+            return java.nio.file.Files.readString(java.nio.file.Path.of("/proc/mounts"));
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * True when {@code path} sits on a mount carrying the noexec option. Picks the longest matching
+     * mount point, since /tmp and / can both be listed.
+     */
+    protected static boolean isNoexec(String mounts, String path) {
+        if (mounts == null || mounts.isBlank() || path == null) {
+            return false;
+        }
+
+        var best = "";
+        var bestNoexec = false;
+        for (String line : mounts.split("\n")) {
+            var parts = line.trim().split("\\s+");
+            if (parts.length < 4) {
+                continue;
+            }
+            var mountPoint = parts[1];
+            var under = path.equals(mountPoint)
+                    || path.startsWith(mountPoint.endsWith("/") ? mountPoint : mountPoint + "/");
+            if (under && mountPoint.length() >= best.length()) {
+                best = mountPoint;
+                bestNoexec = java.util.Arrays.asList(parts[3].split(",")).contains("noexec");
+            }
+        }
+        return bestNoexec;
     }
 
     /**

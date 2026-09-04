@@ -2,6 +2,7 @@ package br.com.datastreambrasil.v4;
 
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -52,10 +53,43 @@ class NativeLoadDiagnosisTest {
     }
 
     @Test
-    void fallsBackToPointingAtTheLoaderLogWhenTheCauseIsUnfamiliar() {
+    void fallsBackToProbingTheEnvironmentWhenTheCauseIsUnfamiliar() {
         var message = StreamingChannelManager.nativeLoadDiagnosis(sdkFailure("something new"));
 
-        assertTrue(message.contains("FFIBootstrap"), message);
+        // the JVM caches a failed static initializer, so a restarted task never sees the real
+        // loader error again - say so instead of leaving the operator with nothing
+        assertTrue(message.contains("first time the SDK is touched"), message);
+    }
+
+    @Test
+    void picksTheLongestMatchingMountWhenDecidingAboutNoexec() {
+        var mounts = """
+                overlay / overlay rw,relatime 0 0
+                tmpfs /tmp tmpfs rw,noexec,nosuid,size=512m 0 0
+                /dev/sdb /tmp/native ext4 rw,relatime 0 0
+                """;
+
+        // /tmp itself is noexec
+        assertTrue(StreamingChannelManager.isNoexec(mounts, "/tmp"));
+        // but a volume mounted underneath it is not, and the longer mount point must win
+        assertFalse(StreamingChannelManager.isNoexec(mounts, "/tmp/native"));
+        // the root mount is not noexec
+        assertFalse(StreamingChannelManager.isNoexec(mounts, "/var/lib/whatever"));
+    }
+
+    @Test
+    void noexecCheckIsSafeWhenProcMountsIsUnavailable() {
+        assertFalse(StreamingChannelManager.isNoexec("", "/tmp"));
+        assertFalse(StreamingChannelManager.isNoexec(null, "/tmp"));
+        assertFalse(StreamingChannelManager.isNoexec("garbage", null));
+    }
+
+    @Test
+    void doesNotMistakeAPrefixForAMountPoint() {
+        var mounts = "tmpfs /tmpfoo tmpfs rw,noexec 0 0\noverlay / overlay rw 0 0\n";
+
+        // /tmp is not under /tmpfoo despite the shared prefix
+        assertFalse(StreamingChannelManager.isNoexec(mounts, "/tmp"));
     }
 
     @Test
