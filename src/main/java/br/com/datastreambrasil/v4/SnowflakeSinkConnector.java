@@ -41,7 +41,7 @@ public class SnowflakeSinkConnector extends SinkConnector {
     protected static final String CFG_PIPE = "pipe";
     protected static final String CFG_CHANNEL_NAME_PREFIX = "channel_name_prefix";
     protected static final String CFG_MAX_CLIENT_LAG_SECONDS = "max_client_lag_seconds";
-    protected static final String CFG_COMMIT_WAIT_TIMEOUT = "commit_wait_timeout";
+    protected static final String CFG_MERGE_INTERVAL = "merge_interval";
     protected static final String CFG_APPEND_MAX_RETRIES = "append_max_retries";
     protected static final String CFG_FAIL_ON_ROW_ERROR = "fail_on_row_error";
 
@@ -93,9 +93,13 @@ public class SnowflakeSinkConnector extends SinkConnector {
         .define(CFG_MAX_CLIENT_LAG_SECONDS, ConfigDef.Type.INT, null, ConfigDef.Importance.MEDIUM,
             "SDK parameter override 'max_client_lag_seconds'. Higher values buffer longer and produce "
                 + "fewer, larger files. Leave unset to use the SDK default.")
-        .define(CFG_COMMIT_WAIT_TIMEOUT, ConfigDef.Type.STRING, "PT60S", ConfigDef.Importance.MEDIUM,
-            "How long to wait for Snowflake to commit a block before running MERGE/DELETE. "
-                + "Duration format. Only used when ingestion_only is false.")
+        .define(CFG_MERGE_INTERVAL, ConfigDef.Type.STRING, "PT0S", ConfigDef.Importance.HIGH,
+            "Minimum time between MERGE/DELETE cycles, in Duration format. Only used when "
+                + "ingestion_only is false. The default of PT0S merges on every Connect commit "
+                + "(offset.flush.interval.ms, 60s by default), which costs a warehouse resume per "
+                + "cycle regardless of how few rows arrived - the warehouse bills a 60s minimum "
+                + "each time. Raising this to PT15M cuts the cycles by 15x; rows simply wait in "
+                + "the ingest table, and Kafka offsets wait with them, so nothing is lost.")
         .define(CFG_APPEND_MAX_RETRIES, ConfigDef.Type.INT, 5, ConfigDef.Importance.MEDIUM,
             "Retries with exponential backoff for retryable appendRow failures (429/500/503)")
         .define(CFG_FAIL_ON_ROW_ERROR, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.HIGH,

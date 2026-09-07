@@ -25,8 +25,11 @@ Two modes:
 - **`ingestion_only: true`** — rows land in `_INGEST` and nothing else runs. No MERGE, no cleanup
   job, no warehouse at steady state. Deduplication is yours to do in Snowflake, typically with a
   Dynamic Table (there is a worked example in [`infra/scripts/snowflake_v4.sql`](infra/scripts/snowflake_v4.sql)).
-- **`ingestion_only: false`** — after each commit cycle the connector waits for the block to be
-  durable and then runs MERGE/DELETE into the final table, like v3 did.
+- **`ingestion_only: false`** — the connector also applies what Snowflake already holds to the
+  final table with MERGE/DELETE, like v3 did. `merge_interval` controls how often that happens:
+  the default merges on every Connect commit (60s), and raising it to `PT15M` cuts the cycles by
+  15x. The statement costs nearly the same for one row as for a million — 0.67s vs 0.75s measured —
+  so what drives the bill is how many cycles run, not how much data moves.
 
 ### Prerequisites
 
@@ -70,7 +73,7 @@ everything.
 | `pipe` | string | `<table>_INGEST-STREAMING` | Override to use a custom pipe |
 | `channel_name_prefix` | string | connector name | Must be stable across restarts |
 | `max_client_lag_seconds` | int | SDK default | Higher buffers longer, writing fewer and larger files |
-| `commit_wait_timeout` | duration | `PT60S` | Wait for a block to land before MERGE; merge mode only |
+| `merge_interval` | duration | `PT0S` | Minimum time between MERGE cycles; merge mode only |
 | `append_max_retries` | int | `5` | Retries with backoff on 408/429/500/503 |
 | `fail_on_row_error` | boolean | `true` | Fail the task when the pipe rejects rows, as v3's COPY did |
 | `find_columns_in_metadata` | boolean | `false` | Same meaning and default as v3 |

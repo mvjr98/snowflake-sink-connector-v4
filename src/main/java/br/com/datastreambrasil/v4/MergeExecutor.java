@@ -6,16 +6,23 @@ import org.apache.logging.log4j.Logger;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Applies a committed block of the ingest table to the final table, used only when
- * {@code ingestion_only} is false.
+ * Applies a range of the ingest table to the final table, used only when {@code ingestion_only}
+ * is false.
  *
- * <p>v3 could rely on its in-memory buffer being keyed by primary key, so a block never held two
- * rows for the same key. v4 streams every event, so the block must be deduplicated in SQL: the
+ * <p>The rows to apply are named by a half-open Kafka offset range per partition rather than by a
+ * block id. The lower bound is the last offset already merged, which Kafka Connect persists as the
+ * committed offset, so the range survives a restart: whatever a crash left unmerged in the ingest
+ * table is still inside the next range and gets applied. A block id lives only in the task's
+ * memory and would strand those rows.
+ *
+ * <p>v3 could rely on its in-memory buffer being keyed by primary key, so a batch never held two
+ * rows for the same key. v4 streams every event, so the range must be deduplicated in SQL: the
  * {@code QUALIFY ROW_NUMBER()} runs <em>before</em> the {@code ih_op} filter, which both avoids
  * Snowflake's "Duplicate row detected during DML action" error and stops an update from
- * resurrecting a key whose last operation in the block was a delete.
+ * resurrecting a key whose last operation in the range was a delete.
  *
  * <p>The ordering assumes a given primary key always lands in the same Kafka partition, which
  * holds for Debezium topics keyed by primary key.
@@ -24,11 +31,12 @@ public class MergeExecutor {
 
     private static final Logger LOGGER = LogManager.getLogger(MergeExecutor.class);
 
-    private static final String LATEST_PER_PK = """
-        SELECT * FROM %s
-        WHERE ih_blockid = '%s'
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY %s ORDER BY ih_offset DESC) = 1
-        """;
+    /** One partition's slice of the range: everything after {@code from}, up to and including {@code to}. */
+    public record OffsetRange(int partition, long fromExclusive, long toInclusive) {
+        boolean isEmpty() {
+            return toInclusive <= fromExclusive;
+        }
+    }
 
     private final Connection connection;
     private final String tableName;
@@ -45,12 +53,12 @@ public class MergeExecutor {
         this.ingestOnlyColumns = List.copyOf(ingestOnlyColumns);
     }
 
-    public void merge(String blockId, List<String> pks) {
-        execute(buildMergeSql(blockId, pks), "merge");
+    public void merge(Map<Integer, OffsetRange> ranges, List<String> pks) {
+        execute(buildMergeSql(ranges, pks), "merge");
     }
 
-    public void deleteRows(String blockId, List<String> pks) {
-        execute(buildDeleteSql(blockId, pks), "delete");
+    public void deleteRows(Map<Integer, OffsetRange> ranges, List<String> pks) {
+        execute(buildDeleteSql(ranges, pks), "delete");
     }
 
     private void execute(String sql, String label) {
@@ -58,7 +66,7 @@ public class MergeExecutor {
         var startTime = System.currentTimeMillis();
         try (var stmt = connection.createStatement()) {
             var affected = stmt.executeLargeUpdate(sql);
-            LOGGER.debug("{} affected {} rows in {} ms", label, affected,
+            LOGGER.info("{} affected {} rows in {} ms", label, affected,
                     System.currentTimeMillis() - startTime);
         } catch (SQLException e) {
             LOGGER.error("Error executing {} statement", label, e);
@@ -66,7 +74,7 @@ public class MergeExecutor {
         }
     }
 
-    protected String buildMergeSql(String blockId, List<String> pks) {
+    protected String buildMergeSql(Map<Integer, OffsetRange> ranges, List<String> pks) {
         return String.format(
                 "MERGE INTO %s AS final USING ("
                         + "SELECT * EXCLUDE (%s) FROM (%s) WHERE ih_op in ('c', 'r', 'u')"
@@ -75,26 +83,46 @@ public class MergeExecutor {
                         + "WHEN MATCHED THEN UPDATE SET %s",
                 tableName,
                 buildExcludeColumns(),
-                latestPerPk(blockId, pks),
+                latestPerPk(ranges, pks),
                 buildPkWhereClause(pks),
                 String.join(",", columnsFinalTable),
                 String.join(",", columnsFinalTable.stream().map(c -> "ingest." + c).toList()),
                 buildUpdateColumns());
     }
 
-    protected String buildDeleteSql(String blockId, List<String> pks) {
+    protected String buildDeleteSql(Map<Integer, OffsetRange> ranges, List<String> pks) {
         return String.format(
                 "DELETE FROM %s as final USING ("
                         + "SELECT %s FROM (%s) WHERE ih_op = 'd'"
                         + ") AS ingest WHERE %s",
                 tableName,
                 String.join(",", pks),
-                latestPerPk(blockId, pks),
+                latestPerPk(ranges, pks),
                 buildPkWhereClause(pks));
     }
 
-    private String latestPerPk(String blockId, List<String> pks) {
-        return String.format(LATEST_PER_PK, ingestTableName, blockId, String.join(",", pks)).trim();
+    private String latestPerPk(Map<Integer, OffsetRange> ranges, List<String> pks) {
+        return String.format(
+                "SELECT * FROM %s WHERE %s "
+                        + "QUALIFY ROW_NUMBER() OVER (PARTITION BY %s ORDER BY ih_offset DESC) = 1",
+                ingestTableName, buildRangePredicate(ranges), String.join(",", pks));
+    }
+
+    /**
+     * Restricts the scan to the offsets that have not been merged yet, so the statement never
+     * reprocesses the whole ingest table.
+     */
+    protected String buildRangePredicate(Map<Integer, OffsetRange> ranges) {
+        var clauses = ranges.values().stream()
+                .filter(r -> !r.isEmpty())
+                .map(r -> String.format("(ih_partition = %d and ih_offset > %d and ih_offset <= %d)",
+                        r.partition(), r.fromExclusive(), r.toInclusive()))
+                .toList();
+
+        if (clauses.isEmpty()) {
+            throw new IllegalArgumentException("No non-empty offset range to merge");
+        }
+        return "(" + String.join(" or ", clauses) + ")";
     }
 
     protected String buildUpdateColumns() {

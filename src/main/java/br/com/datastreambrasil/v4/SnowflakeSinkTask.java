@@ -20,6 +20,7 @@ import org.quartz.TriggerBuilder;
 import org.quartz.impl.StdSchedulerFactory;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -29,8 +30,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 public class SnowflakeSinkTask extends SinkTask {
 
@@ -40,7 +39,6 @@ public class SnowflakeSinkTask extends SinkTask {
 
     private boolean ingestionOnly;
     private boolean failOnRowError;
-    private Duration commitWaitTimeout;
     private String tableName;
     private String ingestTableName;
     private String databaseName;
@@ -61,11 +59,21 @@ public class SnowflakeSinkTask extends SinkTask {
     /** Rejected-row counters last reported per partition, to log only the delta. */
     private final Map<TopicPartition, Long> rowErrorCounts = new HashMap<>();
 
-    // merge-mode bookkeeping, only touched from the single Connect worker thread
-    private String currentBlockId = UUID.randomUUID().toString();
+    // merge-mode bookkeeping, only touched from the single Connect worker thread.
+    //
+    // lastMerged is the watermark: everything at or below it has been applied to the final table,
+    // and it is exactly what preCommit reports to Kafka. Seeding it from the first record seen on
+    // a partition means a restart picks up wherever the previous run stopped merging, so a crash
+    // between "rows are in _INGEST" and "rows are merged" costs nothing.
+    private final Map<TopicPartition, Long> lastMerged = new HashMap<>();
     private final Map<TopicPartition, Long> appendedMax = new HashMap<>();
     private boolean blockHasUpserts;
     private boolean blockHasDeletes;
+    private Instant lastMergeAt = Instant.EPOCH;
+    private Duration mergeInterval = Duration.ZERO;
+
+    /** Stamped into ih_blockid purely for tracing; the MERGE selects on the offset range. */
+    private String currentBatchId = UUID.randomUUID().toString();
 
     @Override
     public String version() {
@@ -83,7 +91,7 @@ public class SnowflakeSinkTask extends SinkTask {
 
         ingestionOnly = config.getBoolean(SnowflakeSinkConnector.CFG_INGESTION_ONLY);
         failOnRowError = config.getBoolean(SnowflakeSinkConnector.CFG_FAIL_ON_ROW_ERROR);
-        commitWaitTimeout = Duration.parse(config.getString(SnowflakeSinkConnector.CFG_COMMIT_WAIT_TIMEOUT));
+        mergeInterval = Duration.parse(config.getString(SnowflakeSinkConnector.CFG_MERGE_INTERVAL));
         tableName = config.getString(SnowflakeSinkConnector.CFG_TABLE_NAME);
         ingestTableName = tableName + INGEST_SUFFIX;
         resolveSnowflakeLocation(config);
@@ -213,13 +221,19 @@ public class SnowflakeSinkTask extends SinkTask {
             }
         });
 
-        if (!committed.isEmpty()) {
-            // resume exactly where Snowflake left off instead of where Kafka thinks we are
+        // Only ingestion_only may jump forward to Snowflake's token. In merge mode Kafka's
+        // committed offset is the merge watermark and is at or behind Snowflake's, so skipping
+        // ahead would strand rows that reached the ingest table but were never merged.
+        if (ingestionOnly && !committed.isEmpty()) {
             var rewind = new LinkedHashMap<TopicPartition, Long>();
             committed.forEach((tp, offset) -> rewind.put(tp, offset + 1));
             LOGGER.info("Rewinding consumer to Snowflake committed offsets: {}", rewind);
             context.offset(rewind);
         }
+
+        // the first record delivered on each partition sets the watermark, and Connect resumes from
+        // the last merged offset, so that record is exactly the first unmerged one
+        partitions.forEach(lastMerged::remove);
     }
 
     @Override
@@ -228,10 +242,9 @@ public class SnowflakeSinkTask extends SinkTask {
             committedAtOpen.remove(tp);
             rowErrorCounts.remove(tp);
             appendedMax.remove(tp);
+            lastMerged.remove(tp);
         });
         if (appendedMax.isEmpty()) {
-            // the whole block went away with the revoked partitions; its rows stay in the ingest
-            // table with their block id and are superseded once the records are redelivered
             blockHasUpserts = false;
             blockHasDeletes = false;
         }
@@ -248,19 +261,31 @@ public class SnowflakeSinkTask extends SinkTask {
         for (SinkRecord record : collection) {
             var tp = new TopicPartition(record.topic(), record.kafkaPartition());
 
-            var alreadyCommitted = committedAtOpen.get(tp);
-            if (alreadyCommitted != null && record.kafkaOffset() <= alreadyCommitted) {
-                // Snowflake already has this record; the rewind in open() may not have taken
-                // effect for records already buffered in the consumer
-                continue;
+            if (!ingestionOnly) {
+                // the first record on this partition is the first one not yet merged
+                lastMerged.putIfAbsent(tp, record.kafkaOffset() - 1);
             }
 
-            var row = rowMapper.toRow(record, currentBlockId);
+            // resolve the primary key before the skip below: after a restart every redelivered
+            // record can already be in the ingest table, and the MERGE still needs the key
             if (pks.isEmpty()) {
                 pks = rowMapper.extractPk(record);
                 LOGGER.info("Primary key columns resolved from record key schema: {}", pks);
             }
 
+            var alreadyCommitted = committedAtOpen.get(tp);
+            if (alreadyCommitted != null && record.kafkaOffset() <= alreadyCommitted) {
+                // Snowflake already has this record - either the rewind in open() had not taken
+                // effect yet, or in merge mode these rows are in the ingest table awaiting a merge.
+                // Either way it must not be appended twice, but it still belongs to the range.
+                if (!ingestionOnly) {
+                    appendedMax.merge(tp, record.kafkaOffset(), Math::max);
+                    markOperation(record);
+                }
+                continue;
+            }
+
+            var row = rowMapper.toRow(record, currentBatchId);
             try {
                 channels.appendRow(tp, row, record.kafkaOffset());
             } catch (SFException e) {
@@ -272,14 +297,19 @@ public class SnowflakeSinkTask extends SinkTask {
 
             if (!ingestionOnly) {
                 appendedMax.merge(tp, record.kafkaOffset(), Math::max);
-                if (RowMapper.DebeziumOperation.d.name().equalsIgnoreCase(rowMapper.operationOf(record))) {
-                    blockHasDeletes = true;
-                } else {
-                    blockHasUpserts = true;
-                }
+                markOperation(record);
             }
         }
     }
+
+    private void markOperation(SinkRecord record) {
+        if (RowMapper.DebeziumOperation.d.name().equalsIgnoreCase(rowMapper.operationOf(record))) {
+            blockHasDeletes = true;
+        } else {
+            blockHasUpserts = true;
+        }
+    }
+
 
     /**
      * A 409 means another client took the channel over. Reopen it, rewind to whatever Snowflake
@@ -302,15 +332,22 @@ public class SnowflakeSinkTask extends SinkTask {
     public Map<TopicPartition, OffsetAndMetadata> preCommit(
             Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
 
-        if (!ingestionOnly) {
-            runMergeCycle();
-        }
-
         var statuses = channels.statuses();
         reportRowErrors(statuses);
+        var snowflakeCommitted = channels.committedOffsets(statuses);
+
+        currentBatchId = UUID.randomUUID().toString();
+
+        if (!ingestionOnly) {
+            runMergeCycle(snowflakeCommitted);
+        }
+
+        // ingestion_only reports what Snowflake holds; merge mode reports the merge watermark, so
+        // Kafka never moves past rows that have not reached the final table yet
+        var source = ingestionOnly ? snowflakeCommitted : lastMerged;
 
         var result = new HashMap<TopicPartition, OffsetAndMetadata>();
-        channels.committedOffsets(statuses).forEach((tp, committed) -> {
+        source.forEach((tp, committed) -> {
             var current = currentOffsets.get(tp);
             if (current == null) {
                 return;
@@ -327,38 +364,44 @@ public class SnowflakeSinkTask extends SinkTask {
      * is only rotated after both statements succeed, so a failure retries the same block on the
      * next cycle rather than losing it.
      */
-    private void runMergeCycle() {
-        if (appendedMax.isEmpty()) {
+    private void runMergeCycle(Map<TopicPartition, Long> snowflakeCommitted) {
+        // merge only what Snowflake already holds durably - reading the committed offset token is
+        // the confirmation, so there is nothing to wait for
+        var ranges = new HashMap<Integer, MergeExecutor.OffsetRange>();
+        snowflakeCommitted.forEach((tp, committed) -> {
+            var from = lastMerged.get(tp);
+            if (from != null && committed > from) {
+                ranges.put(tp.partition(), new MergeExecutor.OffsetRange(tp.partition(), from, committed));
+            }
+        });
+
+        if (ranges.isEmpty()) {
+            return;
+        }
+        if (Duration.between(lastMergeAt, Instant.now()).compareTo(mergeInterval) < 0) {
+            // hold the rows in the ingest table and leave the Kafka offsets where they are, so a
+            // crash before the next cycle simply replays into the same range
+            LOGGER.debug("Holding {} partition(s) until the merge interval of {} elapses",
+                    ranges.size(), mergeInterval);
             return;
         }
 
-        var blockId = currentBlockId;
-        var pending = Map.copyOf(appendedMax);
-
-        var futures = pending.entrySet().stream()
-                .map(entry -> channels.waitForCommit(entry.getKey(), entry.getValue(), commitWaitTimeout))
-                .toArray(CompletableFuture[]::new);
-        try {
-            CompletableFuture.allOf(futures).get(commitWaitTimeout.toMillis() + 5_000, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new ConnectException("Interrupted while waiting for Snowflake to commit block " + blockId, e);
-        } catch (Exception e) {
-            throw new RetriableException("Timed out waiting for Snowflake to commit block " + blockId
-                    + "; will retry on the next commit", e);
-        }
-
         if (blockHasUpserts) {
-            mergeExecutor.merge(blockId, pks);
+            mergeExecutor.merge(ranges, pks);
         }
         if (blockHasDeletes) {
-            mergeExecutor.deleteRows(blockId, pks);
+            mergeExecutor.deleteRows(ranges, pks);
         }
 
-        currentBlockId = UUID.randomUUID().toString();
-        appendedMax.clear();
+        // only advance once both statements succeeded; a failure leaves the watermark alone and the
+        // same range is retried on the next cycle
+        ranges.values().forEach(r -> lastMerged.entrySet().stream()
+                .filter(e -> e.getKey().partition() == r.partition())
+                .forEach(e -> e.setValue(r.toInclusive())));
+        lastMergeAt = Instant.now();
         blockHasUpserts = false;
         blockHasDeletes = false;
+        appendedMax.clear();
     }
 
     /**

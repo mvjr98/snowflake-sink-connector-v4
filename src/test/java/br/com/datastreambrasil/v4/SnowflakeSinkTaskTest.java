@@ -224,28 +224,33 @@ class SnowflakeSinkTaskTest {
         assertTrue(e.getMessage().contains("rejected rows"), e.getMessage());
     }
 
-    @Test
-    void mergeModeWaitsForTheBlockToLandThenMergesAndDeletes() throws SQLException {
-        when(channels.waitForCommit(any(), anyLong(), any(Duration.class)))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        var task = task(Map.of("ingestion_only", "false"));
-
-        task.put(List.of(record("c", "1", 0L), record("d", "2", 1L)));
-        task.preCommit(Map.of(TP, new OffsetAndMetadata(2L)));
-
-        // waits for the highest appended offset of the block before running any DML
-        verify(channels).waitForCommit(eq(TP), eq(1L), any(Duration.class));
-        verify(statement).executeLargeUpdate(matches("(?s)MERGE INTO EVENTS.*"));
-        verify(statement).executeLargeUpdate(matches("(?s)DELETE FROM EVENTS.*"));
+    /** Tells the mocked channels that Snowflake has durably committed up to {@code offset}. */
+    private void snowflakeHasUpTo(long offset) {
+        var status = status(Long.toString(offset), 0L);
+        when(channels.statuses()).thenReturn(Map.of(TP, status));
+        when(channels.committedOffsets(anyMap())).thenReturn(Map.of(TP, offset));
     }
 
     @Test
-    void mergeModeOnlyRunsTheStatementsTheBlockNeeds() throws SQLException {
-        when(channels.waitForCommit(any(), anyLong(), any(Duration.class)))
-                .thenReturn(CompletableFuture.completedFuture(null));
+    void mergeModeAppliesWhatSnowflakeAlreadyHolds() throws SQLException {
         var task = task(Map.of("ingestion_only", "false"));
+        task.put(List.of(record("c", "1", 0L), record("d", "2", 1L)));
+        snowflakeHasUpTo(1L);
 
+        var offsets = task.preCommit(Map.of(TP, new OffsetAndMetadata(2L)));
+
+        // the range is merged, and only then does Kafka advance past it
+        verify(statement).executeLargeUpdate(matches("(?s)MERGE INTO EVENTS.*"));
+        verify(statement).executeLargeUpdate(matches("(?s)DELETE FROM EVENTS.*"));
+        assertEquals(2L, offsets.get(TP).offset());
+    }
+
+    @Test
+    void mergeModeOnlyRunsTheStatementsTheRangeNeeds() throws SQLException {
+        var task = task(Map.of("ingestion_only", "false"));
         task.put(List.of(record("c", "1", 0L)));
+        snowflakeHasUpTo(0L);
+
         task.preCommit(Map.of(TP, new OffsetAndMetadata(1L)));
 
         verify(statement).executeLargeUpdate(matches("(?s)MERGE INTO EVENTS.*"));
@@ -253,19 +258,47 @@ class SnowflakeSinkTaskTest {
     }
 
     @Test
-    void mergeModeKeepsTheBlockWhenSnowflakeHasNotCommittedYet() throws SQLException {
-        when(channels.waitForCommit(any(), anyLong(), any(Duration.class)))
-                .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("not yet")))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        var task = task(Map.of("ingestion_only", "false"));
+    void mergeIntervalHoldsTheCycleAndKafkaWaitsWithIt() throws SQLException {
+        var task = task(Map.of("ingestion_only", "false", "merge_interval", "PT1H"));
+
+        // first cycle always runs, so a restart with a backlog is not stalled by the interval
         task.put(List.of(record("c", "1", 0L)));
+        snowflakeHasUpTo(0L);
+        var first = task.preCommit(Map.of(TP, new OffsetAndMetadata(1L)));
+        verify(statement, times(1)).executeLargeUpdate(matches("(?s)MERGE INTO EVENTS.*"));
+        assertEquals(1L, first.get(TP).offset());
 
-        assertThrows(RetriableException.class, () -> task.preCommit(Map.of(TP, new OffsetAndMetadata(1L))));
-        verify(statement, never()).executeLargeUpdate(anyString());
+        // second cycle is inside the interval: no statement, and Kafka stays on the watermark so a
+        // crash simply replays into the same range
+        task.put(List.of(record("c", "2", 1L), record("c", "3", 2L)));
+        snowflakeHasUpTo(2L);
+        var held = task.preCommit(Map.of(TP, new OffsetAndMetadata(3L)));
 
-        // the block is not lost: the next cycle retries the same one
-        task.preCommit(Map.of(TP, new OffsetAndMetadata(1L)));
+        verify(statement, times(1)).executeLargeUpdate(matches("(?s)MERGE INTO EVENTS.*"));
+        assertEquals(1L, held.get(TP).offset());
+    }
+
+    @Test
+    void mergeModeDoesNotSkipRowsThatReachedIngestButWereNotMerged() throws SQLException {
+        // simulates a restart: Snowflake's channel is ahead of Kafka's committed offset because
+        // the previous run appended rows and died before merging them
+        when(channels.open(any())).thenReturn(Map.of(TP, 5L));
+        var task = task(Map.of("ingestion_only", "false"));
+        task.open(List.of(TP));
+
+        // merge mode must not jump the consumer forward to Snowflake's token
+        verify(context, never()).offset(anyMap());
+
+        // Connect redelivers from its own committed offset; those rows are already in the ingest
+        // table, so they are not appended again but still belong to the range
+        task.put(List.of(record("c", "1", 3L), record("c", "2", 4L), record("c", "3", 5L)));
+        verify(channels, never()).appendRow(any(), anyMap(), anyLong());
+
+        snowflakeHasUpTo(5L);
+        var offsets = task.preCommit(Map.of(TP, new OffsetAndMetadata(6L)));
+
         verify(statement).executeLargeUpdate(matches("(?s)MERGE INTO EVENTS.*"));
+        assertEquals(6L, offsets.get(TP).offset());
     }
 
     @Test
